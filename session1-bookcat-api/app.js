@@ -1,6 +1,13 @@
 const express = require('express');
 const dbConfig = require("./dbConfig");
-const sql = require('mssql');   
+const sql = require('mssql');  
+const Joi = require('joi');
+
+const copySchema = Joi.object({
+  isbn: Joi.string().length(10).required(),
+  copyNo: Joi.number().integer().min(1).required()
+});
+
 const app = express();
 app.use(express.json());
 
@@ -138,16 +145,21 @@ app.delete("/authors/:id", async (req, res) => {
 
 // GET all books
 app.get('/books', async (req, res) => {
+  const { title } = req.query;
   let connection;
   try {
     connection = await sql.connect(dbConfig);
-    const result = await connection.request().query(
-      'SELECT ISBN, Title, YearPublish, PublisherID, BookCat FROM Book'
-    );
+    const request = connection.request();
+    let query = 'SELECT ISBN, Title, YearPublish, PublisherID, BookCat FROM Book';
+    if (title) {
+      query += " WHERE Title LIKE '%' + @title + '%'";
+      request.input('title', sql.VarChar(200), title);
+    }
+    const result = await request.query(query);
     res.status(200).json(result.recordset);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: 'Server error' });
   } finally {
     if (connection) await connection.close();
   }
@@ -289,6 +301,100 @@ app.delete('/books/:isbn/copies/:copyNo', async (req, res) => {
     res.status(500).json({ error: 'Database error' });
   } finally {
     if (connection) await connection.close();
+  }
+});
+
+/* The check helper (Lab 8) + validate the rent route (Lab 9)
+(Lab 8) checkAvailable looks the copy up. It gives back null if there is no such copy,
+true if it is free (Status 'D') and false if it is taken. 
+(Lab 9) replacing the two lines that read isbn and copyNo */
+
+async function checkAvailable(isbn, copyNo) {
+  let connection;
+  try {
+    connection = await sql.connect(dbConfig);
+    const result = await connection.request()
+      .input('isbn', sql.Char(10), isbn)
+      .input('copyNo', sql.TinyInt, copyNo)
+      .query('SELECT Status FROM BookCopy WHERE ISBN = @isbn AND CopyNo = @copyNo');
+    if (result.recordset.length === 0) return null;
+    return result.recordset[0].Status === 'D';
+  } finally {
+    if (connection) await connection.close();
+  }
+}
+
+/* The write helper
+markRented sets the copy's Status to 'M'. */
+
+async function markRented(isbn, copyNo) {
+  let connection;
+  try {
+    connection = await sql.connect(dbConfig);
+    await connection.request()
+      .input('isbn', sql.Char(10), isbn)
+      .input('copyNo', sql.TinyInt, copyNo)
+      .query("UPDATE BookCopy SET Status = 'M' WHERE ISBN = @isbn AND CopyNo = @copyNo");
+  } finally {
+    if (connection) await connection.close();
+  }
+}
+
+/* The return helper
+Adding this next to markRented sets Status back to 'D'.*/
+
+async function markReturned(isbn, copyNo) {
+  let connection;
+  try {
+    connection = await sql.connect(dbConfig);
+    await connection.request()
+      .input('isbn', sql.Char(10), isbn)
+      .input('copyNo', sql.TinyInt, copyNo)
+      .query("UPDATE BookCopy SET Status = 'D' WHERE ISBN = @isbn AND CopyNo = @copyNo");
+  } finally {
+    if (connection) await connection.close();
+  }
+}
+
+/* The rent route
+The route calls the check, reads its answer, and only then calls the write. */
+
+
+app.put('/books/:isbn/copies/:copyNo/rent', async (req, res) => {
+  const { error, value } = copySchema.validate(req.params);
+  if (error) return res.status(400).json({ error: error.details[0].message });
+  const isbn = value.isbn;
+  const copyNo = value.copyNo;
+  try {
+    const available = await checkAvailable(isbn, copyNo);
+
+    if (available === null) return res.status(404).json({ error: 'Not found' });
+    if (available === false) return res.status(409).json({ error: 'Copy is already rented' });
+
+    await markRented(isbn, copyNo);
+
+    res.status(200).json({ ISBN: isbn, copyNo: copyNo, Status: 'M' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* The return route
+Same shape as rent, the other way round: a copy that is already free can't be returned. */
+
+app.put('/books/:isbn/copies/:copyNo/return', async (req, res) => {
+  const { error, value } = copySchema.validate(req.params);
+  if (error) return res.status(400).json({ error: error.details[0].message });
+  try {
+    const available = await checkAvailable(value.isbn, value.copyNo);
+    if (available === null) return res.status(404).json({ error: 'Not found' });
+    if (available === true) return res.status(409).json({ error: 'Copy is not rented' });
+    await markReturned(value.isbn, value.copyNo);
+    res.status(200).json({ ISBN: value.isbn, copyNo: value.copyNo, Status: 'D' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
